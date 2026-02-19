@@ -1,6 +1,6 @@
 """
 Complete Automatic JazzCash Donation Counter
-Reads SMS from phone and updates counter live
+Reads emails from SMS Forwarder and updates counter
 """
 
 from flask import Flask, render_template_string, jsonify, request
@@ -8,14 +8,25 @@ from datetime import datetime
 import json
 import os
 import re
-from threading import Thread
 import time
+import threading
+import pickle
+import base64
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
 # ==================== CONFIGURATION ====================
 DATA_FILE = 'donations.json'
-RATION_BAG_COST = 4500  # Rs. 4500 per bag
+RATION_BAG_COST = 4500
+
+# Gmail Configuration
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+FROM_EMAIL = 'timeass59@gmail.com'  # Your SMS Forwarder email
+TO_EMAIL = 'areezahmadch@gmail.com'  # Your Gmail
 
 # ==================== DATA STORAGE ====================
 def load_donations():
@@ -30,47 +41,171 @@ def save_donations(donations):
     with open(DATA_FILE, 'w') as f:
         json.dump(donations, f, indent=2)
 
-# ==================== SMS PARSING ====================
+# ==================== GMAIL INTEGRATION ====================
+def get_gmail_service():
+    """Authenticate and return Gmail service"""
+    creds = None
+    
+    # Token file stores user's access tokens
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    
+    # If no valid credentials, let user log in
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            # Use credentials.json for authentication
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        
+        # Save credentials
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+    
+    return build('gmail', 'v1', credentials=creds)
+
 def parse_jazzcash_sms(sms_text):
     """
-    Parse JazzCash SMS to extract:
-    - Amount
-    - Sender name
-    - Transaction ID
+    Parse your specific JazzCash SMS format:
+    "Rs 10.00 received in your JazzCash Mobile Account:03095877041 via Raast. TID: 704100096110"
     """
-    # Common JazzCash SMS patterns (adjust based on your actual SMS)
-    patterns = [
-        # Pattern 1: "Rs. 500 received from Muhammad Ali. Trx ID: JC123456"
-        r'Rs\.?\s*(\d+[,\d]*)\s*(?:received|transferred|sent).*?(?:from|by)\s*([A-Za-z\s]+)\.?\s*(?:Trx|Transaction)?\s*(?:ID|id)?:?\s*([A-Z0-9]+)',
+    try:
+        print(f"🔍 Parsing SMS: {sms_text}")
         
-        # Pattern 2: "You received Rs.500 from Muhammad Ali (JC123456)"
-        r'received\s*Rs\.?\s*(\d+[,\d]*)\s*from\s*([A-Za-z\s]+).*?([A-Z0-9]+)',
+        # Extract amount (Rs 10.00)
+        amount_match = re.search(r'Rs\s*(\d+\.?\d*)', sms_text)
+        if not amount_match:
+            print("❌ No amount found in SMS")
+            return None
+        amount = float(amount_match.group(1))
+        print(f"💰 Found amount: Rs.{amount}")
         
-        # Pattern 3: "Transaction of Rs.500 from Muhammad Ali successful. ID: JC123456"
-        r'Transaction.*?Rs\.?\s*(\d+[,\d]*).*?from\s*([A-Za-z\s]+).*?ID:?\s*([A-Z0-9]+)',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, sms_text, re.IGNORECASE)
-        if match:
-            amount_str = match.group(1).replace(',', '')
-            amount = float(amount_str)
-            name = match.group(2).strip()
-            transaction_id = match.group(3).strip()
-            return {
-                'amount': amount,
-                'name': name,
-                'transaction_id': transaction_id
-            }
-    
-    return None
+        # Extract transaction ID (TID: 704100096110)
+        tid_match = re.search(r'TID:\s*(\d+)', sms_text)
+        transaction_id = tid_match.group(1) if tid_match else f"TXN{int(time.time())}"
+        print(f"🔢 Transaction ID: {transaction_id}")
+        
+        # For now, use generic name since SMS doesn't have donor name
+        name = "JazzCash Donor"
+        
+        return {
+            'amount': amount,
+            'name': name,
+            'transaction_id': transaction_id
+        }
+    except Exception as e:
+        print(f"❌ Parse error: {e}")
+        return None
 
-# ==================== API ENDPOINTS ====================
+def check_emails():
+    """Background thread to check for new donation emails"""
+    print("📧 Email checker started - waiting for emails from timeass59@gmail.com")
+    print(f"📧 Checking for emails from: {FROM_EMAIL} to: {TO_EMAIL}")
+    
+    while True:
+        try:
+            # Get Gmail service
+            service = get_gmail_service()
+            
+            # Search for unread emails from your SMS Forwarder
+            query = f'from:{FROM_EMAIL} to:{TO_EMAIL} is:unread'
+            print(f"🔍 Searching: {query}")
+            
+            results = service.users().messages().list(
+                userId='me', 
+                q=query,
+                maxResults=5
+            ).execute()
+            
+            messages = results.get('messages', [])
+            print(f"📨 Found {len(messages)} unread emails")
+            
+            for message in messages:
+                print(f"\n📨 Processing email ID: {message['id']}")
+                
+                # Get full message
+                msg = service.users().messages().get(
+                    userId='me', 
+                    id=message['id'],
+                    format='full'
+                ).execute()
+                
+                # Extract email body
+                email_text = ""
+                if 'payload' in msg:
+                    if 'parts' in msg['payload']:
+                        for part in msg['payload']['parts']:
+                            if part['mimeType'] == 'text/plain':
+                                data = part['body'].get('data', '')
+                                if data:
+                                    email_text = base64.urlsafe_b64decode(data).decode()
+                                    break
+                    else:
+                        # Simple message without parts
+                        data = msg['payload']['body'].get('data', '')
+                        if data:
+                            email_text = base64.urlsafe_b64decode(data).decode()
+                
+                print(f"📝 Email content preview: {email_text[:150]}...")
+                
+                # Parse SMS from email
+                donation = parse_jazzcash_sms(email_text)
+                
+                if donation:
+                    print(f"💰 Parsed donation: Rs.{donation['amount']} - {donation['transaction_id']}")
+                    
+                    # Save to donations
+                    donations = load_donations()
+                    
+                    # Check for duplicate
+                    exists = False
+                    for d in donations:
+                        if d['transaction_id'] == donation['transaction_id']:
+                            exists = True
+                            print("⏭️ Duplicate transaction, skipping")
+                            break
+                    
+                    if not exists:
+                        now = datetime.now()
+                        donations.append({
+                            'transaction_id': donation['transaction_id'],
+                            'amount': donation['amount'],
+                            'name': donation['name'],
+                            'time': now.strftime('%I:%M %p'),
+                            'date': now.strftime('%Y-%m-%d')
+                        })
+                        save_donations(donations)
+                        print(f"✅ ADDED TO COUNTER: Rs.{donation['amount']} from {donation['name']}")
+                        print(f"📊 Total donations now: {len(donations)}")
+                else:
+                    print("❌ Could not parse donation from email")
+                
+                # Mark as read
+                try:
+                    service.users().messages().modify(
+                        userId='me',
+                        id=message['id'],
+                        body={'removeLabelIds': ['UNREAD']}
+                    ).execute()
+                    print("✅ Email marked as read")
+                except Exception as e:
+                    print(f"⚠️ Could not mark as read: {e}")
+                
+        except Exception as e:
+            print(f"❌ Email check error: {e}")
+            print("🔄 Will retry in 30 seconds...")
+        
+        # Wait 30 seconds before next check
+        time.sleep(30)
+
+# ==================== ROUTES ====================
 @app.route('/')
 def index():
     """Main counter page"""
-    return render_template_string('''
-<!DOCTYPE html>
+    return '''<!DOCTYPE html>
 <html>
 <head>
     <title>Ramadan Rashan Drive 2026 - Live Counter</title>
@@ -261,25 +396,6 @@ def index():
             font-size: 1rem;
         }
         
-        .loading {
-            display: inline-block;
-            width: 60px;
-            height: 60px;
-            border: 5px solid #f3f3f3;
-            border-top: 5px solid #0a4d2e;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
-        
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        
-        .hidden {
-            display: none;
-        }
-        
         @media (max-width: 768px) {
             .ramadan-title { font-size: 2rem; }
             .total-amount { font-size: 4rem; }
@@ -298,9 +414,7 @@ def index():
             </div>
             <div class="year">2026</div>
             
-            <div id="loading" class="loading"></div>
-            
-            <div id="content" class="hidden">
+            <div id="content">
                 <div class="total-section">
                     <div class="total-label">TOTAL COLLECTED</div>
                     <div class="total-amount">
@@ -346,8 +460,6 @@ def index():
                 .then(data => {
                     if (data.success) {
                         updateDisplay(data);
-                        document.getElementById('loading').classList.add('hidden');
-                        document.getElementById('content').classList.remove('hidden');
                     }
                 })
                 .catch(error => {
@@ -360,7 +472,7 @@ def index():
             
             document.getElementById('totalAmount').textContent = formatter.format(data.total_amount);
             document.getElementById('totalDonations').textContent = data.total_donations;
-            document.getElementById('avgDonation').textContent = formatter.format(Math.round(data.avg_donation));
+            document.getElementById('avgDonation').textContent = formatter.format(data.avg_donation);
             document.getElementById('todayDonations').textContent = data.today_count;
             document.getElementById('totalBags').textContent = data.total_bags;
             
@@ -393,310 +505,7 @@ def index():
     </script>
 </body>
 </html>
-    ''')
-
-@app.route('/api/stats')
-def get_stats():
-    """Get current donation statistics"""
-    donations = load_donations()
-    
-    if not donations:
-        return jsonify({
-            'success': True,
-            'total_amount': 0,
-            'total_donations': 0,
-            'total_bags': 0,
-            'avg_donation': 0,
-            'today_count': 0,
-            'recent_donations': []
-        })
-    
-    total_amount = sum(d['amount'] for d in donations)
-    total_donations = len(donations)
-    total_bags = int(total_amount / RATION_BAG_COST)
-    avg_donation = total_amount / total_donations if total_donations > 0 else 0
-    
-    # Today's donations
-    today = datetime.now().strftime('%Y-%m-%d')
-    today_count = sum(1 for d in donations if d.get('date') == today)
-    
-    # Recent 10 donations
-    recent = sorted(donations, key=lambda x: x['time'], reverse=True)[:10]
-    recent_list = [{
-        'name': d.get('name', 'Anonymous'),
-        'amount': d['amount'],
-        'time': d['time']
-    } for d in recent]
-    
-    return jsonify({
-        'success': True,
-        'total_amount': total_amount,
-        'total_donations': total_donations,
-        'total_bags': total_bags,
-        'avg_donation': round(avg_donation),
-        'today_count': today_count,
-        'recent_donations': recent_list
-    })
-
-# ==================== SMS WEBHOOK (From Your Phone) ====================
-@app.route('/api/sms-webhook', methods=['POST'])
-def sms_webhook():
-    """Receive SMS from your phone"""
-    try:
-        data = request.json
-        sms_text = data.get('sms', '')
-        
-        # Parse SMS
-        parsed = parse_jazzcash_sms(sms_text)
-        
-        if parsed:
-            donations = load_donations()
-            
-            # Check for duplicate
-            for d in donations:
-                if d['transaction_id'] == parsed['transaction_id']:
-                    return jsonify({'status': 'duplicate'})
-            
-            # Add new donation
-            now = datetime.now()
-            donations.append({
-                'transaction_id': parsed['transaction_id'],
-                'amount': parsed['amount'],
-                'name': parsed['name'],
-                'time': now.strftime('%I:%M %p'),
-                'date': now.strftime('%Y-%m-%d')
-            })
-            
-            save_donations(donations)
-            print(f"✅ Auto-recorded: Rs.{parsed['amount']} from {parsed['name']}")
-            return jsonify({'status': 'success'})
-        
-        return jsonify({'status': 'ignored', 'reason': 'not a donation SMS'})
-        
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        return jsonify({'status': 'error'}), 500
-
-# ==================== MANUAL ENTRY (For Testing) ====================
-@app.route('/api/manual-add', methods=['POST'])
-def manual_add():
-    """Manually add a donation"""
-    data = request.json
-    donations = load_donations()
-    
-    now = datetime.now()
-    donations.append({
-        'transaction_id': f"MANUAL{len(donations)+1}",
-        'amount': float(data['amount']),
-        'name': data.get('name', 'Anonymous'),
-        'time': now.strftime('%I:%M %p'),
-        'date': now.strftime('%Y-%m-%d')
-    })
-    
-    save_donations(donations)
-    return jsonify({'success': True})
-
-if __name__ == '__main__':
-    # Create empty data file
-    if not os.path.exists(DATA_FILE):
-        save_donations([])
-    
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
-
-"""
-Complete Automatic JazzCash Donation Counter
-Reads emails from SMS Forwarder and updates counter
-"""
-
-from flask import Flask, render_template_string, jsonify, request
-from datetime import datetime
-import json
-import os
-import re
-import time
-import threading
-import pickle
-import base64
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-
-app = Flask(__name__)
-
-# ==================== CONFIGURATION ====================
-DATA_FILE = 'donations.json'
-RATION_BAG_COST = 4500
-
-# Gmail Configuration
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-FROM_EMAIL = 'timeass59@gmail.com'  # Your SMS Forwarder email
-TO_EMAIL = 'areezahmadch@gmail.com'  # Your Gmail
-
-# ==================== DATA STORAGE ====================
-def load_donations():
-    """Load donations from file"""
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f:
-            return json.load(f)
-    return []
-
-def save_donations(donations):
-    """Save donations to file"""
-    with open(DATA_FILE, 'w') as f:
-        json.dump(donations, f, indent=2)
-
-# ==================== GMAIL INTEGRATION ====================
-def get_gmail_service():
-    """Authenticate and return Gmail service"""
-    creds = None
-    
-    # Token file stores user's access tokens
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
-    
-    # If no valid credentials, let user log in
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # You'll need to upload credentials.json to Replit
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        
-        # Save credentials
-        with open('token.pickle', 'wb') as pickle.dump(creds, token)
-    
-    return build('gmail', 'v1', credentials=creds)
-
-def parse_jazzcash_sms(sms_text):
-    """
-    Parse your specific JazzCash SMS format:
-    "Rs 10.00 received in your JazzCash Mobile Account:03095877041 via Raast. TID: 704100096110"
-    """
-    try:
-        # Extract amount (Rs 10.00)
-        amount_match = re.search(r'Rs\s*(\d+\.?\d*)', sms_text)
-        if not amount_match:
-            return None
-        amount = float(amount_match.group(1))
-        
-        # Extract transaction ID (TID: 704100096110)
-        tid_match = re.search(r'TID:\s*(\d+)', sms_text)
-        transaction_id = tid_match.group(1) if tid_match else f"TXN{int(time.time())}"
-        
-        # For now, use generic name since SMS doesn't have donor name
-        # You can customize this later
-        name = "JazzCash Donor"
-        
-        return {
-            'amount': amount,
-            'name': name,
-            'transaction_id': transaction_id
-        }
-    except Exception as e:
-        print(f"❌ Parse error: {e}")
-        return None
-
-def check_emails():
-    """Background thread to check for new donation emails"""
-    print("📧 Email checker started - waiting for emails from timeass59@gmail.com")
-    
-    while True:
-        try:
-            # Get Gmail service
-            service = get_gmail_service()
-            
-            # Search for unread emails from your SMS Forwarder
-            query = f'from:{FROM_EMAIL} to:{TO_EMAIL} is:unread'
-            results = service.users().messages().list(
-                userId='me', 
-                q=query
-            ).execute()
-            
-            messages = results.get('messages', [])
-            
-            for message in messages:
-                print(f"📨 Found new email from {FROM_EMAIL}")
-                
-                # Get full message
-                msg = service.users().messages().get(
-                    userId='me', 
-                    id=message['id'],
-                    format='full'
-                ).execute()
-                
-                # Extract email body
-                email_text = ""
-                if 'payload' in msg:
-                    if 'parts' in msg['payload']:
-                        for part in msg['payload']['parts']:
-                            if part['mimeType'] == 'text/plain':
-                                data = part['body'].get('data', '')
-                                if data:
-                                    email_text = base64.urlsafe_b64decode(data).decode()
-                                    break
-                    else:
-                        # Simple message without parts
-                        data = msg['payload']['body'].get('data', '')
-                        if data:
-                            email_text = base64.urlsafe_b64decode(data).decode()
-                
-                print(f"📝 Email content: {email_text[:100]}...")  # First 100 chars
-                
-                # Parse SMS from email
-                donation = parse_jazzcash_sms(email_text)
-                
-                if donation:
-                    print(f"💰 Parsed: Rs.{donation['amount']} - {donation['transaction_id']}")
-                    
-                    # Save to donations
-                    donations = load_donations()
-                    
-                    # Check for duplicate
-                    exists = False
-                    for d in donations:
-                        if d['transaction_id'] == donation['transaction_id']:
-                            exists = True
-                            print("⏭️ Duplicate transaction, skipping")
-                            break
-                    
-                    if not exists:
-                        now = datetime.now()
-                        donations.append({
-                            'transaction_id': donation['transaction_id'],
-                            'amount': donation['amount'],
-                            'name': donation['name'],
-                            'time': now.strftime('%I:%M %p'),
-                            'date': now.strftime('%Y-%m-%d')
-                        })
-                        save_donations(donations)
-                        print(f"✅ ADDED: Rs.{donation['amount']} from {donation['name']}")
-                else:
-                    print("❌ Could not parse donation from email")
-                
-                # Mark as read
-                service.users().messages().modify(
-                    userId='me',
-                    id=message['id'],
-                    body={'removeLabelIds': ['UNREAD']}
-                ).execute()
-                print("✅ Email marked as read")
-                
-        except Exception as e:
-            print(f"❌ Email check error: {e}")
-        
-        # Wait 30 seconds before next check
-        time.sleep(30)
-
-# ==================== ROUTES ====================
-@app.route('/')
-def index():
-    """Main counter page"""
-    return '''YOUR EXISTING HTML TEMPLATE HERE'''  # Keep your beautiful HTML
+    '''
 
 @app.route('/api/stats')
 def get_stats():
@@ -743,7 +552,7 @@ def get_stats():
 
 @app.route('/api/manual-add', methods=['POST'])
 def manual_add():
-    """Manually add a donation"""
+    """Manually add a donation for testing"""
     data = request.json
     donations = load_donations()
     
@@ -751,13 +560,13 @@ def manual_add():
     donations.append({
         'transaction_id': f"MANUAL{len(donations)+1}",
         'amount': float(data['amount']),
-        'name': data.get('name', 'Anonymous'),
+        'name': data.get('name', 'Manual Entry'),
         'time': now.strftime('%I:%M %p'),
         'date': now.strftime('%Y-%m-%d')
     })
     
     save_donations(donations)
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'message': 'Donation added'})
 
 # ==================== START BACKGROUND THREAD ====================
 # Start email checking in background
@@ -768,6 +577,15 @@ if __name__ == '__main__':
     # Create empty data file
     if not os.path.exists(DATA_FILE):
         save_donations([])
+        print("📁 Created empty donations file")
+    
+    print("="*50)
+    print("🚀 RAMADAN RASHAN DRIVE 2026")
+    print("="*50)
+    print(f"📊 Live URL: https://web-service--areezahmadch.replit.app")
+    print(f"📧 Checking emails from: {FROM_EMAIL}")
+    print(f"📧 To: {TO_EMAIL}")
+    print("="*50)
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
