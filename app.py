@@ -1,6 +1,6 @@
 """
-Complete JazzCash Donation Counter with IMAP Email Fetching
-Automatically reads emails from timeass59@gmail.com and updates counter
+JazzCash Donation Counter - Vercel Compatible Version
+Uses cron jobs to check emails periodically
 """
 
 from flask import Flask, render_template_string, jsonify, request
@@ -8,33 +8,44 @@ from datetime import datetime
 import json
 import os
 import re
-import time
-import threading
 import imaplib
 import email
+import hashlib
 
 app = Flask(__name__)
 
 # ==================== CONFIGURATION ====================
-DATA_FILE = 'donations.json'
+DATA_FILE = '/tmp/donations.json'  # Vercel can write to /tmp
 RATION_BAG_COST = 4500
 
 # Email Configuration - CHANGE THESE!
 EMAIL_ACCOUNT = "areezahmadch@gmail.com"
-EMAIL_PASSWORD = "ecvc hdne jtfb cvup"  # Your 16-character App Password
+EMAIL_PASSWORD = "ecvc hdne jtfb cvup"  # Your App Password
 FROM_EMAIL = "timeass59@gmail.com"  # Who sends the emails
+
+# Secret key for cron job (CHANGE THIS!)
+CRON_SECRET = "ramadan2026_secret_key_123"
 
 # ==================== DATA STORAGE ====================
 def load_donations():
     """Load donations from file"""
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f:
+    # Try to load from /tmp first (writable in Vercel)
+    if os.path.exists('/tmp/donations.json'):
+        with open('/tmp/donations.json', 'r') as f:
+            return json.load(f)
+    # Fallback to local file (for development)
+    elif os.path.exists('donations.json'):
+        with open('donations.json', 'r') as f:
             return json.load(f)
     return []
 
 def save_donations(donations):
     """Save donations to file"""
-    with open(DATA_FILE, 'w') as f:
+    # Save to /tmp for Vercel
+    with open('/tmp/donations.json', 'w') as f:
+        json.dump(donations, f, indent=2)
+    # Also save locally for development
+    with open('donations.json', 'w') as f:
         json.dump(donations, f, indent=2)
 
 # ==================== SMS PARSING ====================
@@ -56,12 +67,11 @@ def parse_jazzcash_sms(sms_text):
         tid_match = re.search(r'TID:\s*(\d+)', sms_text)
         transaction_id = tid_match.group(1) if tid_match else f"TXN{int(time.time())}"
         
-        # Extract phone number (optional - for reference)
+        # Extract phone number
         phone_match = re.search(r'(\d{11})', sms_text)
         phone = phone_match.group(1) if phone_match else "Unknown"
         
-        # Donor name - since SMS doesn't have name, we'll use "JazzCash Donor"
-        # You can change this later if you want
+        # Donor name
         name = "JazzCash Donor"
         
         return {
@@ -74,47 +84,42 @@ def parse_jazzcash_sms(sms_text):
         print(f"❌ Parse error: {e}")
         return None
 
-# ==================== IMAP EMAIL CHECKER ====================
-def check_emails_imap():
+# ==================== EMAIL CHECKER FUNCTION ====================
+def check_emails_once():
     """
-    Background thread that checks Gmail every 30 seconds
-    for new emails from timeass59@gmail.com
+    Check emails once - called by cron endpoint
+    Returns dict with results
     """
-    print("="*50)
-    print("📧 IMAP EMAIL CHECKER STARTED")
-    print(f"📧 Checking emails from: {FROM_EMAIL}")
-    print(f"📧 To: {EMAIL_ACCOUNT}")
-    print("="*50)
+    print("📧 Checking emails once...")
+    result = {
+        'processed': 0,
+        'found': 0,
+        'errors': []
+    }
     
-    while True:
-        try:
-            # Connect to Gmail IMAP
-            print("\n🔄 Checking for new emails...")
-            mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
-            mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-            mail.select('inbox')
-            
-            # Search for unread emails from your SMS Forwarder
-            search_criteria = f'(UNSEEN FROM "{FROM_EMAIL}")'
-            result, data = mail.search(None, search_criteria)
-            
-            email_ids = data[0].split()
-            if email_ids:
-                print(f"📨 Found {len(email_ids)} new email(s)!")
-            
-            for email_id in email_ids:
-                print(f"\n📨 Processing email ID: {email_id.decode() if isinstance(email_id, bytes) else email_id}")
-                
+    try:
+        # Connect to Gmail IMAP
+        mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
+        mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
+        mail.select('inbox')
+        
+        # Search for unread emails from your SMS Forwarder
+        search_criteria = f'(UNSEEN FROM "{FROM_EMAIL}")'
+        result_code, data = mail.search(None, search_criteria)
+        
+        email_ids = data[0].split()
+        result['found'] = len(email_ids)
+        
+        print(f"📨 Found {len(email_ids)} new email(s)!")
+        
+        for email_id in email_ids:
+            try:
                 # Fetch the email
-                result, data = mail.fetch(email_id, '(RFC822)')
+                result_code, data = mail.fetch(email_id, '(RFC822)')
                 raw_email = data[0][1]
                 
                 # Parse email
                 msg = email.message_from_bytes(raw_email)
-                
-                # Get email subject
-                subject = msg.get('Subject', 'No Subject')
-                print(f"📧 Subject: {subject}")
                 
                 # Get email body
                 body = ""
@@ -125,8 +130,6 @@ def check_emails_imap():
                             break
                 else:
                     body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                
-                print(f"📝 Body preview: {body[:150]}...")
                 
                 # Parse SMS from email body
                 donation = parse_jazzcash_sms(body)
@@ -157,6 +160,7 @@ def check_emails_imap():
                             'date': now.strftime('%Y-%m-%d')
                         })
                         save_donations(donations)
+                        result['processed'] += 1
                         print(f"✅✅✅ ADDED TO COUNTER: Rs.{donation['amount']}")
                         print(f"📊 Total donations now: {len(donations)}")
                 else:
@@ -165,16 +169,21 @@ def check_emails_imap():
                 # Mark as read
                 mail.store(email_id, '+FLAGS', '\\Seen')
                 print(f"✅ Email marked as read")
-            
-            mail.close()
-            mail.logout()
-            
-        except Exception as e:
-            print(f"❌ IMAP error: {e}")
-            print("🔄 Will retry in 30 seconds...")
+                
+            except Exception as e:
+                error_msg = f"Error processing email {email_id}: {str(e)}"
+                print(f"❌ {error_msg}")
+                result['errors'].append(error_msg)
         
-        # Wait 30 seconds before next check
-        time.sleep(30)
+        mail.close()
+        mail.logout()
+        
+    except Exception as e:
+        error_msg = f"IMAP connection error: {str(e)}"
+        print(f"❌ {error_msg}")
+        result['errors'].append(error_msg)
+    
+    return result
 
 # ==================== FLASK ROUTES ====================
 @app.route('/')
@@ -369,6 +378,16 @@ def index():
             font-size: 1rem;
         }
         
+        .status-badge {
+            display: inline-block;
+            background: #28a745;
+            color: white;
+            padding: 5px 15px;
+            border-radius: 50px;
+            font-size: 0.9rem;
+            margin-top: 20px;
+        }
+        
         @media (max-width: 768px) {
             .ramadan-title { font-size: 2rem; }
             .total-amount { font-size: 4rem; }
@@ -423,6 +442,7 @@ def index():
             <div class="last-updated">
                 Last updated: <span id="lastUpdated">just now</span>
             </div>
+            <div class="status-badge" id="autoUpdateStatus">Auto-updates every 30 seconds</div>
         </div>
     </div>
 
@@ -465,9 +485,9 @@ def index():
                 new Date().toLocaleTimeString();
         }
         
-        // Fetch every 5 seconds
+        // Fetch every 30 seconds
         fetchStats();
-        setInterval(fetchStats, 5000);
+        setInterval(fetchStats, 30000);
     </script>
 </body>
 </html>
@@ -516,6 +536,23 @@ def get_stats():
         'recent_donations': recent_list
     })
 
+@app.route('/api/cron-check-emails')
+def cron_check_emails():
+    """Endpoint called by cron job service"""
+    # Check secret for security
+    secret = request.args.get('secret')
+    if secret != CRON_SECRET:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    # Run email check
+    result = check_emails_once()
+    
+    return jsonify({
+        'success': True,
+        'timestamp': datetime.now().isoformat(),
+        'result': result
+    })
+
 @app.route('/api/manual-add', methods=['POST'])
 def manual_add():
     """Manually add a donation for testing"""
@@ -534,27 +571,32 @@ def manual_add():
     save_donations(donations)
     return jsonify({'success': True})
 
-# ==================== START BACKGROUND THREAD ====================
-# Start IMAP email checker in background
-email_thread = threading.Thread(target=check_emails_imap, daemon=True)
-email_thread.start()
+@app.route('/api/status')
+def status():
+    """Check if the app is running"""
+    donations = load_donations()
+    return jsonify({
+        'status': 'online',
+        'total_donations': len(donations),
+        'last_check': datetime.now().isoformat()
+    })
 
-# ==================== MAIN ====================
+# ==================== FOR LOCAL DEVELOPMENT ====================
 if __name__ == '__main__':
-    # Create empty data file
-    if not os.path.exists(DATA_FILE):
+    # Create empty data file if it doesn't exist
+    if not os.path.exists('donations.json'):
         save_donations([])
         print("📁 Created empty donations file")
     
     print("\n" + "="*60)
-    print("🚀 RAMADAN RASHAN DRIVE 2026 - LIVE COUNTER")
+    print("🚀 RAMADAN RASHAN DRIVE 2026 - LOCAL DEVELOPMENT")
     print("="*60)
-    print(f"📊 Live URL: https://web-service--areezahmadch.replit.app")
-    print(f"📧 Auto-checking emails from: {FROM_EMAIL}")
-    print(f"📧 To: {EMAIL_ACCOUNT}")
+    print("📧 Email account:", EMAIL_ACCOUNT)
+    print("📧 Checking from:", FROM_EMAIL)
     print("="*60)
-    print("\n⏰ Email checker runs every 30 seconds")
-    print("✅ Ready to track donations!\n")
+    print("\n✅ Server running at http://localhost:5002")
+    print("⏰ For production: Use cron job service")
+    print("="*60)
     
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get('PORT', 5002))
+    app.run(host='0.0.0.0', port=port, debug=True)
