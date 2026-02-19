@@ -1,6 +1,6 @@
 """
-Complete Automatic JazzCash Donation Counter
-Reads emails from SMS Forwarder and updates counter
+Complete JazzCash Donation Counter with IMAP Email Fetching
+Automatically reads emails from timeass59@gmail.com and updates counter
 """
 
 from flask import Flask, render_template_string, jsonify, request
@@ -10,12 +10,8 @@ import os
 import re
 import time
 import threading
-import pickle
-import base64
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
+import imaplib
+import email
 
 app = Flask(__name__)
 
@@ -23,10 +19,10 @@ app = Flask(__name__)
 DATA_FILE = 'donations.json'
 RATION_BAG_COST = 4500
 
-# Gmail Configuration
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-FROM_EMAIL = 'timeass59@gmail.com'  # Your SMS Forwarder email
-TO_EMAIL = 'areezahmadch@gmail.com'  # Your Gmail
+# Email Configuration - CHANGE THESE!
+EMAIL_ACCOUNT = "areezahmadch@gmail.com"
+EMAIL_PASSWORD = "ecvc hdne jtfb cvup"  # Your 16-character App Password
+FROM_EMAIL = "timeass59@gmail.com"  # Who sends the emails
 
 # ==================== DATA STORAGE ====================
 def load_donations():
@@ -41,123 +37,104 @@ def save_donations(donations):
     with open(DATA_FILE, 'w') as f:
         json.dump(donations, f, indent=2)
 
-# ==================== GMAIL INTEGRATION ====================
-def get_gmail_service():
-    """Authenticate and return Gmail service"""
-    creds = None
-    
-    # Token file stores user's access tokens
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
-    
-    # If no valid credentials, let user log in
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # Use credentials.json for authentication
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        
-        # Save credentials
-        with open('token.pickle', 'wb') as token:
-            pickle.dump(creds, token)
-    
-    return build('gmail', 'v1', credentials=creds)
-
+# ==================== SMS PARSING ====================
 def parse_jazzcash_sms(sms_text):
     """
-    Parse your specific JazzCash SMS format:
-    "Rs 10.00 received in your JazzCash Mobile Account:03095877041 via Raast. TID: 704100096110"
+    Parse JazzCash SMS from email body
+    Format: "Rs 10.00 received in your JazzCash Mobile Account:03095877041 via Raast. TID: 704100096110"
     """
     try:
-        print(f"🔍 Parsing SMS: {sms_text}")
+        print(f"🔍 Parsing: {sms_text[:100]}...")
         
-        # Extract amount (Rs 10.00)
+        # Extract amount
         amount_match = re.search(r'Rs\s*(\d+\.?\d*)', sms_text)
         if not amount_match:
-            print("❌ No amount found in SMS")
             return None
         amount = float(amount_match.group(1))
-        print(f"💰 Found amount: Rs.{amount}")
         
-        # Extract transaction ID (TID: 704100096110)
+        # Extract transaction ID
         tid_match = re.search(r'TID:\s*(\d+)', sms_text)
         transaction_id = tid_match.group(1) if tid_match else f"TXN{int(time.time())}"
-        print(f"🔢 Transaction ID: {transaction_id}")
         
-        # For now, use generic name since SMS doesn't have donor name
+        # Extract phone number (optional - for reference)
+        phone_match = re.search(r'(\d{11})', sms_text)
+        phone = phone_match.group(1) if phone_match else "Unknown"
+        
+        # Donor name - since SMS doesn't have name, we'll use "JazzCash Donor"
+        # You can change this later if you want
         name = "JazzCash Donor"
         
         return {
             'amount': amount,
             'name': name,
-            'transaction_id': transaction_id
+            'transaction_id': transaction_id,
+            'phone': phone
         }
     except Exception as e:
         print(f"❌ Parse error: {e}")
         return None
 
-def check_emails():
-    """Background thread to check for new donation emails"""
-    print("📧 Email checker started - waiting for emails from timeass59@gmail.com")
-    print(f"📧 Checking for emails from: {FROM_EMAIL} to: {TO_EMAIL}")
+# ==================== IMAP EMAIL CHECKER ====================
+def check_emails_imap():
+    """
+    Background thread that checks Gmail every 30 seconds
+    for new emails from timeass59@gmail.com
+    """
+    print("="*50)
+    print("📧 IMAP EMAIL CHECKER STARTED")
+    print(f"📧 Checking emails from: {FROM_EMAIL}")
+    print(f"📧 To: {EMAIL_ACCOUNT}")
+    print("="*50)
     
     while True:
         try:
-            # Get Gmail service
-            service = get_gmail_service()
+            # Connect to Gmail IMAP
+            print("\n🔄 Checking for new emails...")
+            mail = imaplib.IMAP4_SSL('imap.gmail.com', 993)
+            mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
+            mail.select('inbox')
             
             # Search for unread emails from your SMS Forwarder
-            query = f'from:{FROM_EMAIL} to:{TO_EMAIL} is:unread'
-            print(f"🔍 Searching: {query}")
+            search_criteria = f'(UNSEEN FROM "{FROM_EMAIL}")'
+            result, data = mail.search(None, search_criteria)
             
-            results = service.users().messages().list(
-                userId='me', 
-                q=query,
-                maxResults=5
-            ).execute()
+            email_ids = data[0].split()
+            if email_ids:
+                print(f"📨 Found {len(email_ids)} new email(s)!")
             
-            messages = results.get('messages', [])
-            print(f"📨 Found {len(messages)} unread emails")
-            
-            for message in messages:
-                print(f"\n📨 Processing email ID: {message['id']}")
+            for email_id in email_ids:
+                print(f"\n📨 Processing email ID: {email_id.decode() if isinstance(email_id, bytes) else email_id}")
                 
-                # Get full message
-                msg = service.users().messages().get(
-                    userId='me', 
-                    id=message['id'],
-                    format='full'
-                ).execute()
+                # Fetch the email
+                result, data = mail.fetch(email_id, '(RFC822)')
+                raw_email = data[0][1]
                 
-                # Extract email body
-                email_text = ""
-                if 'payload' in msg:
-                    if 'parts' in msg['payload']:
-                        for part in msg['payload']['parts']:
-                            if part['mimeType'] == 'text/plain':
-                                data = part['body'].get('data', '')
-                                if data:
-                                    email_text = base64.urlsafe_b64decode(data).decode()
-                                    break
-                    else:
-                        # Simple message without parts
-                        data = msg['payload']['body'].get('data', '')
-                        if data:
-                            email_text = base64.urlsafe_b64decode(data).decode()
+                # Parse email
+                msg = email.message_from_bytes(raw_email)
                 
-                print(f"📝 Email content preview: {email_text[:150]}...")
+                # Get email subject
+                subject = msg.get('Subject', 'No Subject')
+                print(f"📧 Subject: {subject}")
                 
-                # Parse SMS from email
-                donation = parse_jazzcash_sms(email_text)
+                # Get email body
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                            break
+                else:
+                    body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                
+                print(f"📝 Body preview: {body[:150]}...")
+                
+                # Parse SMS from email body
+                donation = parse_jazzcash_sms(body)
                 
                 if donation:
-                    print(f"💰 Parsed donation: Rs.{donation['amount']} - {donation['transaction_id']}")
+                    print(f"💰 Parsed: Rs.{donation['amount']} - TID: {donation['transaction_id']}")
                     
-                    # Save to donations
+                    # Load existing donations
                     donations = load_donations()
                     
                     # Check for duplicate
@@ -165,43 +142,41 @@ def check_emails():
                     for d in donations:
                         if d['transaction_id'] == donation['transaction_id']:
                             exists = True
-                            print("⏭️ Duplicate transaction, skipping")
+                            print(f"⏭️ Duplicate transaction, skipping")
                             break
                     
                     if not exists:
+                        # Add new donation
                         now = datetime.now()
                         donations.append({
                             'transaction_id': donation['transaction_id'],
                             'amount': donation['amount'],
                             'name': donation['name'],
+                            'phone': donation.get('phone', ''),
                             'time': now.strftime('%I:%M %p'),
                             'date': now.strftime('%Y-%m-%d')
                         })
                         save_donations(donations)
-                        print(f"✅ ADDED TO COUNTER: Rs.{donation['amount']} from {donation['name']}")
+                        print(f"✅✅✅ ADDED TO COUNTER: Rs.{donation['amount']}")
                         print(f"📊 Total donations now: {len(donations)}")
                 else:
                     print("❌ Could not parse donation from email")
                 
                 # Mark as read
-                try:
-                    service.users().messages().modify(
-                        userId='me',
-                        id=message['id'],
-                        body={'removeLabelIds': ['UNREAD']}
-                    ).execute()
-                    print("✅ Email marked as read")
-                except Exception as e:
-                    print(f"⚠️ Could not mark as read: {e}")
-                
+                mail.store(email_id, '+FLAGS', '\\Seen')
+                print(f"✅ Email marked as read")
+            
+            mail.close()
+            mail.logout()
+            
         except Exception as e:
-            print(f"❌ Email check error: {e}")
+            print(f"❌ IMAP error: {e}")
             print("🔄 Will retry in 30 seconds...")
         
         # Wait 30 seconds before next check
         time.sleep(30)
 
-# ==================== ROUTES ====================
+# ==================== FLASK ROUTES ====================
 @app.route('/')
 def index():
     """Main counter page"""
@@ -263,6 +238,23 @@ def index():
             font-weight: bold;
         }
         
+        .live-badge {
+            display: inline-block;
+            background: #dc3545;
+            color: white;
+            padding: 5px 15px;
+            border-radius: 50px;
+            font-size: 1rem;
+            margin-bottom: 20px;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        
         .total-section {
             background: linear-gradient(135deg, #f8f9fa, #e9ecef);
             border-radius: 30px;
@@ -282,7 +274,6 @@ def index():
             font-weight: 800;
             color: #0a4d2e;
             line-height: 1.2;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
         }
         
         .total-amount small {
@@ -301,7 +292,6 @@ def index():
             background: #f8f9fa;
             border-radius: 20px;
             padding: 25px;
-            box-shadow: 0 10px 20px rgba(0,0,0,0.05);
         }
         
         .stat-number {
@@ -373,23 +363,6 @@ def index():
             color: #6c757d;
         }
         
-        .live-badge {
-            display: inline-block;
-            background: #dc3545;
-            color: white;
-            padding: 5px 15px;
-            border-radius: 50px;
-            font-size: 1rem;
-            margin-bottom: 20px;
-            animation: pulse 2s infinite;
-        }
-        
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.7; }
-            100% { opacity: 1; }
-        }
-        
         .last-updated {
             color: #6c757d;
             margin-top: 30px;
@@ -439,7 +412,7 @@ def index():
                 
                 <div class="bags-section">
                     <div class="bags-number" id="totalBags">0</div>
-                    <div class="bags-text">Families Will Be Fed</div>
+                    <div class="bags-text">Families Fed</div>
                     <div style="color:#0a4d2e; margin-top:10px;">Each Bag: Rs. 4,500</div>
                 </div>
                 
@@ -462,9 +435,7 @@ def index():
                         updateDisplay(data);
                     }
                 })
-                .catch(error => {
-                    console.error('Error:', error);
-                });
+                .catch(error => console.error('Error:', error));
         }
         
         function updateDisplay(data) {
@@ -490,16 +461,11 @@ def index():
                 recentList.appendChild(item);
             });
             
-            const now = new Date();
             document.getElementById('lastUpdated').textContent = 
-                now.toLocaleTimeString('en-PK', { 
-                    hour: '2-digit', 
-                    minute: '2-digit',
-                    second: '2-digit'
-                });
+                new Date().toLocaleTimeString();
         }
         
-        // Fetch every 5 seconds for real-time updates
+        // Fetch every 5 seconds
         fetchStats();
         setInterval(fetchStats, 5000);
     </script>
@@ -566,26 +532,29 @@ def manual_add():
     })
     
     save_donations(donations)
-    return jsonify({'success': True, 'message': 'Donation added'})
+    return jsonify({'success': True})
 
 # ==================== START BACKGROUND THREAD ====================
-# Start email checking in background
-email_thread = threading.Thread(target=check_emails, daemon=True)
+# Start IMAP email checker in background
+email_thread = threading.Thread(target=check_emails_imap, daemon=True)
 email_thread.start()
 
+# ==================== MAIN ====================
 if __name__ == '__main__':
     # Create empty data file
     if not os.path.exists(DATA_FILE):
         save_donations([])
         print("📁 Created empty donations file")
     
-    print("="*50)
-    print("🚀 RAMADAN RASHAN DRIVE 2026")
-    print("="*50)
+    print("\n" + "="*60)
+    print("🚀 RAMADAN RASHAN DRIVE 2026 - LIVE COUNTER")
+    print("="*60)
     print(f"📊 Live URL: https://web-service--areezahmadch.replit.app")
-    print(f"📧 Checking emails from: {FROM_EMAIL}")
-    print(f"📧 To: {TO_EMAIL}")
-    print("="*50)
+    print(f"📧 Auto-checking emails from: {FROM_EMAIL}")
+    print(f"📧 To: {EMAIL_ACCOUNT}")
+    print("="*60)
+    print("\n⏰ Email checker runs every 30 seconds")
+    print("✅ Ready to track donations!\n")
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
